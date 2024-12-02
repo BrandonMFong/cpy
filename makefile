@@ -107,4 +107,5 @@ notarize:
 staple:
 	xcrun stapler staple $(BIN_DIR)/$(PACKAGE_NAME)-$(PLATFORM).dmg
 
+dependencies:
 
