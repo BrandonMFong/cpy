@@ -40,6 +40,15 @@ help:
 	@echo "	Build for release for Linux distribution"
 	@echo "		make clean build package"
 
+setup: $(BIN_DIR)
+
+$(BIN_PATH)/%:
+	mkdir -p $@
+
+clean:
+	rm -rfv $(BIN_PATH)
+	rm -rfv $(PACKAGE_BIN_PATH)
+
 DIRS = $(addsuffix -setup, $(BUILD_PATH) $(BIN_PATH)/$(CONFIG))
 setup: $(DIRS)
 $(DIRS):
@@ -54,5 +63,19 @@ clean:
 test:
 	RUST_BACKTRACE=1 cargo test -- --test-threads=1
 
-dependencies:
+LIBS_MAKEFILES_PATH:=$(CURDIR)/external/libs/makefiles
+
+### Packaging
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+PACKAGE_NAME = cpy-linux
+endif
+ifeq ($(UNAME_S),Darwin)
+PACKAGE_NAME = cpy-macos
+endif
+PACKAGE_BIN_PATH = $(BIN_PATH)/$(CONFIG)
+PACKAGE_BIN_TARGET = $(BIN_NAME)
+
+include $(LIBS_MAKEFILES_PATH)/package.mk
 
