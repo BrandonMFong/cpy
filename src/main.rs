@@ -15,34 +15,34 @@ use std::fs::canonicalize;
 use std::io::{self, Read, Write};
 use std::convert::TryInto;
 use std::os::unix::fs::symlink;
+use std::sync::atomic::{AtomicI8, Ordering};
 
 const BUFFER_SIZE: usize = 2 << 13; // Chunk size for copying
 const ARG_HELP: &str = "h";
-const ARG_BRIEF_DESCRIPTION: &str = "--brief-description";
+const ARG_FORCE_REPLACE: &str = "f";
+
+static G_APPLY_TO_ALL_ACTION: AtomicI8 = AtomicI8::new(0);
+const APPLY_TO_ALL_ACTION_KEEP_BOTH: i8 = 1;
+const APPLY_TO_ALL_ACTION_STOP: i8 = 2;
+const APPLY_TO_ALL_ACTION_REPLACE: i8 = 3;
 
 fn help() {
     let args: Vec<String> = env::args().collect();
-    println!("usage: {} [ -{} ] <source path> <destination path>", &args[0], ARG_HELP);
+    println!("usage: {} [ -{} ] <source path(s)> <destination path>", &args[0], ARG_HELP);
     println!();
     println!("  Copies all items in source to destination");
     println!();
     println!("  values:");
-    println!("    <source path> : relative or absolute");
+    println!("    <source path(s)> : relative or absolute");
     println!("    <destination path> : relative or absolute");
-}
-
-fn brief_description() {
-    println!("copy tool");
 }
 
 fn main() {
     let mut error = 0;
-    let (h, brief_desc, srcs, dest) = read_arguments();
+    let (h, srcs, dest) = read_arguments();
 
     if h {
         help();
-    } else if brief_desc {
-        brief_description();
     } else {
         error = copy_from_source_to_destination(&srcs, &dest);
     }
@@ -55,17 +55,15 @@ fn main() {
  *
  * return (
  * 0 : help
- * 1 : brief description switch
- * 2 : source paths
- * 3 : destination
+ * 1 : source paths
+ * 2 : destination
  * )
  */
-fn read_arguments() -> (bool, bool, Vec<String>, String) {
+fn read_arguments() -> (bool, Vec<String>, String) {
     let args: Vec<String> = env::args().collect();
     let mut help: bool = false;
     let mut src: Vec<String> = Vec::new();
     let mut dest: String = String::new();
-    let mut brief_description: bool = false;
 
     if args.len() < 2 {
         help = true;
@@ -76,10 +74,13 @@ fn read_arguments() -> (bool, bool, Vec<String>, String) {
 
         // if this is a flag
         if (i == 1) && arg.starts_with("-") {
-            if arg == ARG_BRIEF_DESCRIPTION {
-                brief_description = true;
-            } else if arg.contains(ARG_HELP) {
+            if arg.contains(ARG_HELP) {
                 help = true;
+            } else if arg.contains(ARG_FORCE_REPLACE) {
+                G_APPLY_TO_ALL_ACTION.store(
+                    APPLY_TO_ALL_ACTION_REPLACE,
+                    Ordering::Relaxed
+                );
             }
         } else {
             if i < (args.len() - 1) {
@@ -90,7 +91,7 @@ fn read_arguments() -> (bool, bool, Vec<String>, String) {
         }
     }
 
-    return (help, brief_description, src, dest);
+    return (help, src, dest);
 }
 
 /**
@@ -123,7 +124,7 @@ fn copy_from_source_to_destination(s: &Vec<String>, d: &String) -> i32 {
 
     // Get full paths for params
 
-       println!();
+    println!();
 
     // Do copy
     // 
@@ -202,6 +203,80 @@ fn find_leaf_files(path: &str, found_item_count: &mut i32) -> Result<Vec<String>
     Ok(result)
 }
 
+/**
+ * takes in a path and checks if this path already exists, if so the result will be
+ * an altered name that doesn't have conflict
+ *
+ * Function will also prompt the user for actions like keeping duplicates, stopping operation,
+ * or replacing the duplicate.
+ */
+fn filter_for_conflicts(path: PathBuf) -> Result<PathBuf, i32> {
+    let mut result: PathBuf = path.clone();
+    if !result.exists() {
+        return Ok(result);
+    } else {
+        let mut ans = String::new();
+        let val: i8 = G_APPLY_TO_ALL_ACTION.load(Ordering::Relaxed);
+        if val != 0 {
+            ans = val.to_string();
+        } else {
+            println!(" ! {} already exists. Would you like to...", result.display());
+            println!(" ! {}: Keep Both", APPLY_TO_ALL_ACTION_KEEP_BOTH);
+            println!(" ! {}: Stop", APPLY_TO_ALL_ACTION_STOP);
+            println!(" ! {}: Replace", APPLY_TO_ALL_ACTION_REPLACE);
+            print!(" ! >> ");
+            io::stdout().flush().unwrap();
+        
+            io::stdin().read_line(&mut ans).expect("failed to readline");
+            ans = ans.trim_matches('\n').to_string();
+
+            print!(" ! Apply to all? [y/n] >> ");
+            io::stdout().flush().unwrap();
+            let mut ans2 = String::new();
+            io::stdin().read_line(&mut ans2).expect("failed to readline");
+            ans2 = ans2.trim_matches('\n').to_string();
+            if ans2 == "y" {
+                let val: i8 = ans.parse().expect("Failed to parse string to integer");
+                G_APPLY_TO_ALL_ACTION.store(val, Ordering::Relaxed);
+            }
+        }
+        
+        match ans.parse().expect("Failed to parse string to integer") {
+            APPLY_TO_ALL_ACTION_KEEP_BOTH => { }
+            APPLY_TO_ALL_ACTION_STOP => {
+                eprintln!(" - stopping...");
+                return Err(1);
+            }
+            APPLY_TO_ALL_ACTION_REPLACE => {
+                return Ok(result);
+            },
+            i8::MIN..=0_i8 | 4_i8..=i8::MAX => panic!(" ! unkown response: {}", ans),
+        }
+    }
+
+    let extension = path.extension();
+    let Some(basename) = path.file_stem() else {
+        eprintln!(" ! couldn't get base name (w/o ext) from '{}'", path.display());
+        return Err(1);
+    };
+
+    let mut i = 1;
+    while result.exists() {
+        result.pop();
+        match extension {
+            Some(ext) => {
+                result.push(format!("{}_{}.{}", basename.to_str().unwrap(), i, ext.to_str().unwrap()));
+            }
+            None => {
+                result.push(format!("{}_{}", basename.to_str().unwrap(), i));
+            }
+        }
+
+        i += 1;
+    }
+    return Ok(result);
+}
+
 struct FileFlow {
     /// Source file
     pub source: String,
@@ -273,6 +348,12 @@ impl FileFlow {
         // base path
         dest_path.push(self.source_rel_leaf());
 
+        // check for conflicts
+        let Ok(dest_path) = filter_for_conflicts(dest_path) else {
+            eprintln!(" ! error filtering for destination path");
+            return 1;
+        };
+        
         self.new_destination = dest_path.clone().into_os_string().into_string().unwrap();
 
         // Make sure sub directories are created
@@ -315,10 +396,11 @@ impl FileFlow {
             let mut destination_file = fs::File::create(&self.new_destination)?;
             let mut buffer = [0; BUFFER_SIZE];
             let mut total_bytes_copied = 0;
+            let file_name = Path::new(&self.new_destination).file_name().unwrap().to_str().unwrap();
 
             print!(" - ({} / {}) {} - {:.2}%",
                    curr_index, total_files,
-                   self.source_rel_leaf(),
+                   file_name,
                    (total_bytes_copied as f64 / source_size as f64) * 100.0);
             loop {
                 let bytes_read = source_file.read(&mut buffer)?;
@@ -333,12 +415,12 @@ impl FileFlow {
                 print!("\r");
                 print!(" - ({} / {}) {} - {:.2}%",
                        curr_index, total_files,
-                       self.source_rel_leaf(),
+                       file_name,
                        (total_bytes_copied as f64 / source_size as f64) * 100.0);
             }
             println!("\r - ({} / {}) {} - {:.2}%", 
                      curr_index, total_files,
-                     self.source_rel_leaf(),
+                     file_name,
                      (total_bytes_copied as f64 / source_size as f64) * 100.0);
             
             if let Err(e) = fs::set_permissions(Path::new(&self.new_destination), permissions) {
