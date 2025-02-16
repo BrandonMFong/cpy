@@ -6,3 +6,5 @@
 	- [x] make the stdout show the newly changed name
 - [ ] verify option. Use checksums
 - [x] add version arg
+- [ ] improve copy speeds
+
