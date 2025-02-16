@@ -5,4 +5,4 @@
 	- [x] '-f' argument to force a replacement
 	- [x] make the stdout show the newly changed name
 - [ ] verify option. Use checksums
-- [ ] add version arg
+- [x] add version arg

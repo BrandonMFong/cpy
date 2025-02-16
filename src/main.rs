@@ -17,9 +17,11 @@ use std::convert::TryInto;
 use std::os::unix::fs::symlink;
 use std::sync::atomic::{AtomicI8, Ordering};
 
+const VERSION_STRING: &str = "0.2";
 const BUFFER_SIZE: usize = 2 << 13; // Chunk size for copying
 const ARG_HELP: &str = "h";
 const ARG_FORCE_REPLACE: &str = "f";
+const ARG_VERSION: &str = "--version";
 
 static G_APPLY_TO_ALL_ACTION: AtomicI8 = AtomicI8::new(0);
 const APPLY_TO_ALL_ACTION_KEEP_BOTH: i8 = 1;
@@ -28,21 +30,33 @@ const APPLY_TO_ALL_ACTION_REPLACE: i8 = 3;
 
 fn help() {
     let args: Vec<String> = env::args().collect();
-    println!("usage: {} [ -{} ] <source path(s)> <destination path>", &args[0], ARG_HELP);
+    println!("usage: {} [ -{}{} ] <source path(s)> <destination path>",
+        &args[0],
+        ARG_HELP,
+        ARG_FORCE_REPLACE
+    );
     println!();
-    println!("  Copies all items in source to destination");
+    println!("  flags:");
+    println!("    -h : prints help");
+    println!("    -f : forces replacements");
     println!();
-    println!("  values:");
+    println!("  arguments:");
     println!("    <source path(s)> : relative or absolute");
     println!("    <destination path> : relative or absolute");
 }
 
+fn print_version() {
+    println!("{}", VERSION_STRING);
+}
+
 fn main() {
     let mut error = 0;
-    let (h, srcs, dest) = read_arguments();
+    let (h, show_version, srcs, dest) = read_arguments();
 
     if h {
         help();
+    } else if show_version {
+        print_version();
     } else {
         error = copy_from_source_to_destination(&srcs, &dest);
     }
@@ -59,9 +73,10 @@ fn main() {
  * 2 : destination
  * )
  */
-fn read_arguments() -> (bool, Vec<String>, String) {
+fn read_arguments() -> (bool, bool, Vec<String>, String) {
     let args: Vec<String> = env::args().collect();
     let mut help: bool = false;
+    let mut version: bool = false;
     let mut src: Vec<String> = Vec::new();
     let mut dest: String = String::new();
 
@@ -76,6 +91,8 @@ fn read_arguments() -> (bool, Vec<String>, String) {
         if (i == 1) && arg.starts_with("-") {
             if arg.contains(ARG_HELP) {
                 help = true;
+            } else if arg.contains(ARG_VERSION) {
+                version = true;
             } else if arg.contains(ARG_FORCE_REPLACE) {
                 G_APPLY_TO_ALL_ACTION.store(
                     APPLY_TO_ALL_ACTION_REPLACE,
@@ -91,7 +108,7 @@ fn read_arguments() -> (bool, Vec<String>, String) {
         }
     }
 
-    return (help, src, dest);
+    return (help, version, src, dest);
 }
 
 /**
