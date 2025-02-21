@@ -6,5 +6,6 @@
 	- [x] make the stdout show the newly changed name
 - [ ] verify option. Use checksums
 - [x] add version arg
-- [ ] improve copy speeds
+- [x] improve copy speeds
+	- [x] fix issue with source and dest not matching
 

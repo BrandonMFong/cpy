@@ -12,13 +12,21 @@ use std::path::PathBuf;
 use std::path::Path;
 use std::path::Component;
 use std::fs::canonicalize;
-use std::io::{self, Read, Write};
-use std::convert::TryInto;
+use std::io::{self, Read, Write, BufReader, BufWriter};
 use std::os::unix::fs::symlink;
-use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::atomic::{AtomicI8, Ordering, AtomicU64};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::panic;
+use std::sync::Arc;
+use crossbeam_queue::ArrayQueue;
+use progress_bar::*;
+use std::mem::ManuallyDrop;
+use std::collections::VecDeque;
 
 const VERSION_STRING: &str = "0.2";
-const BUFFER_SIZE: usize = 2 << 13; // Chunk size for copying
+const BUFFER_SIZE: u64 = 1024_u64.pow(2) * 10; // Chunk size for copying
+const STREAM_SIZE: usize = 2 << 5;
 const ARG_HELP: &str = "h";
 const ARG_FORCE_REPLACE: &str = "f";
 const ARG_VERSION: &str = "--version";
@@ -116,10 +124,11 @@ fn read_arguments() -> (bool, bool, Vec<String>, String) {
  */
 fn copy_from_source_to_destination(s: &Vec<String>, d: &String) -> i32 {
     // vector of source/destination pairs
-    let mut flows: Vec<FileFlow> = Vec::new();
+    let mut flows: VecDeque<FileFlow> = VecDeque::new();
+    let overall_elapsed_time = Instant::now();
 
-    println!(" - Unfolding sources for all leaf items");
-    print!(" - Items found: 0");
+    print!("Items found: 0");
+    init_progress_bar(0);
 
     let mut counter = 0;
     let full_dest_path = canonicalize(d).unwrap().into_os_string().into_string().unwrap();
@@ -133,7 +142,7 @@ fn copy_from_source_to_destination(s: &Vec<String>, d: &String) -> i32 {
                 return -1;
             } Ok(files) => {
                 for file in files {
-                    flows.push(FileFlow::new(&full_source_path, &file, &full_dest_path));
+                    flows.push_back(FileFlow::new(&full_source_path, &file, &full_dest_path));
                 }
             }
         }
@@ -146,23 +155,69 @@ fn copy_from_source_to_destination(s: &Vec<String>, d: &String) -> i32 {
     // Do copy
     // 
     // This will only copy one by one
-    println!(" - Initiating copy...");
-    let size = flows.len();
-    for (i, flow) in flows.iter_mut().enumerate() {
+    let num_flows = flows.len();
+    let mut i = 0;
+    while let Some(mut flow) = flows.pop_front() {
+        let flow_time = Instant::now();
+
         // make sure we know where we are copying to
         if flow.setup() != 0 {
             return -1;
         }
 
+        let source_size = flow.source_size();
+        let file_name = flow.new_destination_file_name();
+
+        init_progress_bar(source_size as usize);
+        enable_eta();
+        print_progress_bar_info(
+            "Item",
+            format!("({} / {}) '{}'", i + 1, num_flows, file_name).as_str(),
+            Color::Green,
+            Style::Bold
+        );
+        set_progress_bar_action("Copying", Color::Green, Style::Bold);
+        set_progress_bar_width(25);
+
         // Execute copy
-        match flow.copy(i + 1, size) {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!(" ! Error copying file {}: {}", flow.source, e);
-                return -1;
-            }
+        let dest_size = Arc::new(AtomicU64::new(0));
+        let arc_dest_size = Arc::clone(&dest_size);
+        if let Err(e) = flow.copy(move |destination_size| {
+            arc_dest_size.store(destination_size, Ordering::Relaxed);
+        }) {
+            eprintln!(" ! Error copying file {}: {}", flow.source, e);
+            return -1;
         }
+
+        // wait for copy to end
+        loop {
+            let dsize = dest_size.load(Ordering::Relaxed);
+            if source_size <= dsize {
+                break;
+            } else {
+                set_progress_bar_progress(dsize as usize);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        print_progress_bar_info(
+            "Copied",
+            format!("'{}' in {} seconds, {} bytes", file_name, flow_time.elapsed().as_secs(), source_size).as_str(),
+            Color::Green,
+            Style::Bold
+        );
+
+        flow.set_permissions();
+
+        drop(flow);
+        i += 1;
     }
+    print_progress_bar_final_info(
+        "Finished",
+        format!("copied all in {} seconds", overall_elapsed_time.elapsed().as_secs()).as_str(),
+        Color::Green,
+        Style::Bold
+    );
+    finalize_progress_bar();
 
     return 0;
 }
@@ -197,13 +252,13 @@ fn find_leaf_files(path: &str, found_item_count: &mut i32) -> Result<Vec<String>
 
     if Path::new(path).is_symlink() {
         *found_item_count += 1;
-        print!("\r - Items found: {}", *found_item_count);
+        print!("\rItems found: {}", *found_item_count);
         let p = Path::new(path);
         let abs_path = p.to_lexical_absolute().unwrap().to_str().unwrap().to_string();
         result.push(abs_path);
     } else if Path::new(path).is_file() {
         *found_item_count += 1;
-        print!("\r - Items found: {}", *found_item_count);
+        print!("\rItems found: {}", *found_item_count);
 
         let expanded_path = canonicalize(path).unwrap().into_os_string().into_string().unwrap();
         result.push(expanded_path.to_owned());
@@ -306,7 +361,7 @@ struct FileFlow {
 
     /// Where source file will go respecting
     /// the file structure in base path
-    new_destination: String
+    new_destination: String,
 }
 
 impl FileFlow {
@@ -317,6 +372,43 @@ impl FileFlow {
             source: s.to_string(),
             destination: d.to_string(),
             new_destination: String::new()
+        }
+    }
+
+    /**
+     * returns the source file's size
+     */
+    fn source_size(&self) -> u64 {
+        let Ok(file) = fs::File::open(&self.source) else {
+            return 0
+        };
+
+        let Ok(md) = file.metadata() else {
+            return 0
+        };
+
+        md.len()
+    }
+
+    /**
+     * returns the leaf item of the new destination path
+     *
+     * new_destination is specified in setup()
+     */
+    fn new_destination_file_name(&self) -> String {
+        let default_name: &str = "<unknown file name...>";
+        let file_name = Path::new(&self.new_destination).file_name();
+        if file_name.is_none() {
+            return String::from(default_name)
+        }
+
+        match file_name.unwrap().to_os_string().into_string() {
+            Ok(res) => {
+                res
+            }
+            Err(_) => {
+                String::from(default_name)
+            }
         }
     }
 
@@ -386,10 +478,15 @@ impl FileFlow {
         return 0;
     }
 
-    /// Copies source to newDestination
-    pub fn copy(&self, curr_index: usize, total_files: usize) -> io::Result<()> {
-        let mut source_file = fs::File::open(&self.source)?;
-        let permissions = source_file.metadata()?.permissions();
+    /**
+     * Copies source to newDestination
+     *
+     * update_callback: gets invoked for every buffer that is written to destination. value is the
+     * new size of the destination
+     */
+    pub fn copy<F: Fn(u64) + Send + 'static>(&self, update_callback: F) -> io::Result<()> {
+        let source_file = fs::File::open(&self.source)?;
+        let destination_file = fs::File::create(&self.new_destination)?;
 
         if Path::new(&self.source).is_symlink() {
             let target = fs::read_link(&self.source)?;
@@ -409,44 +506,109 @@ impl FileFlow {
                 }
             }
         } else {
-            let source_size: usize = source_file.metadata().unwrap().len().try_into().unwrap();
-            let mut destination_file = fs::File::create(&self.new_destination)?;
-            let mut buffer = [0; BUFFER_SIZE];
-            let mut total_bytes_copied = 0;
-            let file_name = Path::new(&self.new_destination).file_name().unwrap().to_str().unwrap();
+            let source_size = self.source_size();
+            let stack_size = BUFFER_SIZE as usize * STREAM_SIZE as usize;
+            let stream: Arc<ArrayQueue<ManuallyDrop<[u8;BUFFER_SIZE as usize]>>> = Arc::new(ArrayQueue::new(STREAM_SIZE));
 
-            print!(" - ({} / {}) {} - {:.2}%",
-                   curr_index, total_files,
-                   file_name,
-                   (total_bytes_copied as f64 / source_size as f64) * 100.0);
-            loop {
-                let bytes_read = source_file.read(&mut buffer)?;
-                if bytes_read == 0 {
-                    break; // End of file
-                }
+            // read thread
+            let stream_rh = Arc::clone(&stream);
+            thread::Builder::new()
+                .name("read_thread".into())
+                .stack_size(stack_size)
+                .spawn(move || {
+                    let mut total_read = 0;
+                    let mut readbuf = BufReader::with_capacity(BUFFER_SIZE as usize, source_file);
+                    loop {
+                        if !stream_rh.is_full() {
+                            let buf_size: u64 = if (source_size - total_read) > BUFFER_SIZE {
+                                BUFFER_SIZE
+                            } else {
+                                source_size - total_read
+                            };
+                            let mut buffer = ManuallyDrop::new([0; BUFFER_SIZE as usize]);
+                            match readbuf.read(&mut buffer[..buf_size as usize]) {
+                                Ok(bytes_read) => {
+                                    if bytes_read > 0 {
+                                        total_read += bytes_read as u64;
+                                        if let Err(_) = stream_rh.push(buffer) {
+                                            eprintln!(" ! couldn't send buf to write thread");
+                                            break;
+                                        }
+                                        unsafe { ManuallyDrop::drop(&mut buffer)} ;
+                                    } else {
+                                        break; // End of file
+                                    }
+                                }
+                                Err(e) => {
+                                    panic!("{}", e);
+                                }
+                            }
+                        }
+                    }
+                    drop(stream_rh);
+                    drop(readbuf);
+                    //println!("read end");
+            }).unwrap();
 
-                destination_file.write_all(&buffer[..bytes_read])?;
+            // write thread
+            let stream_wh = Arc::clone(&stream);
+            thread::Builder::new()
+                .name("write_thread".into())
+                .stack_size(stack_size)
+                .spawn(move || {
+                    let mut writebuf = BufWriter::with_capacity(BUFFER_SIZE as usize, destination_file);
+                    let mut total_bytes_copied = 0;
+                    let mut wait_count = 0;
+                    while total_bytes_copied < source_size {
+                        if stream_wh.is_empty() {
+                            wait_count += 1;
+                            if wait_count > (2 << 12) {
+                                thread::sleep(Duration::from_nanos(5));
+                            } else if wait_count > (2 << 8) {
+                                thread::sleep(Duration::from_nanos(1));
+                            }
+                            continue;
+                        }
+                        wait_count = 0;
+                        let mut buffer = stream_wh.pop().unwrap();
+                        let buf_size: u64 = if (source_size - total_bytes_copied) > BUFFER_SIZE {
+                            BUFFER_SIZE
+                        } else {
+                            source_size - total_bytes_copied
+                        };
 
-                total_bytes_copied += bytes_read;
-
-                print!("\r");
-                print!(" - ({} / {}) {} - {:.2}%",
-                       curr_index, total_files,
-                       file_name,
-                       (total_bytes_copied as f64 / source_size as f64) * 100.0);
-            }
-            println!("\r - ({} / {}) {} - {:.2}%", 
-                     curr_index, total_files,
-                     file_name,
-                     (total_bytes_copied as f64 / source_size as f64) * 100.0);
-            
-            if let Err(e) = fs::set_permissions(Path::new(&self.new_destination), permissions) {
-                eprintln!(" ! could not set permissions on '{}': {}", self.new_destination, e);
-                return Err(e);
-            }
+                        if let Err(e) = writebuf.write_all(&buffer[..buf_size as usize]) {
+                            panic!("{}", e);
+                        }
+                        total_bytes_copied += buf_size;
+                        update_callback(total_bytes_copied);
+                        unsafe { ManuallyDrop::drop(&mut buffer) };
+                    }
+                    drop(writebuf);
+                    drop(stream_wh);
+            }).unwrap();
+            drop(stream);
         }
 
         Ok(())
+    }
+
+    /**
+     * copies the source's permissions to the destination
+     */
+    fn set_permissions(&self) {
+        let Ok(source_file) = fs::File::open(&self.source) else {
+            eprintln!(" ! could not open file");
+            return;
+        };
+
+        let Ok(md) = source_file.metadata() else {
+            eprintln!(" ! could not get metadata"); return;
+        };
+
+        if let Err(e) = fs::set_permissions(Path::new(&self.new_destination), md.permissions()) {
+            eprintln!(" ! could not set permissions on '{}': {}", self.new_destination, e);
+        }
     }
 }
 
