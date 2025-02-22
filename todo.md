@@ -9,6 +9,7 @@
 	- [x] make the stdout show the newly changed name
 - [x] checks copy
 - [x] add version arg
+- [ ] add `--check` arg
 - [x] improve copy speeds
 	- [x] fix issue with source and dest not matching
 
