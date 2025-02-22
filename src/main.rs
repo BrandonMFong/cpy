@@ -32,6 +32,7 @@ const STREAM_SIZE: usize = 2 << 5;
 const ARG_HELP: &str = "h";
 const ARG_FORCE_REPLACE: &str = "f";
 const ARG_VERSION: &str = "--version";
+const ARG_CHECK: &str = "--check";
 
 static G_APPLY_TO_ALL_ACTION: AtomicI8 = AtomicI8::new(0);
 const APPLY_TO_ALL_ACTION_KEEP_BOTH: i8 = 1;
@@ -40,7 +41,7 @@ const APPLY_TO_ALL_ACTION_REPLACE: i8 = 3;
 
 fn help() {
     let args: Vec<String> = env::args().collect();
-    println!("usage: {} [ -{}{} ] <source path(s)> <destination path>",
+    println!("usage: {} [ -{}{} ] [ <options> ] <source path(s)> <destination path>",
         &args[0],
         ARG_HELP,
         ARG_FORCE_REPLACE
@@ -50,9 +51,15 @@ fn help() {
     println!("    -h : prints help");
     println!("    -f : forces replacements");
     println!();
+    println!("  options:");
+    println!("    --version : prints version");
+    println!("    --check : certifies if source was completely copied to destination");
+    println!();
     println!("  arguments:");
     println!("    <source path(s)> : relative or absolute");
     println!("    <destination path> : relative or absolute");
+    println!();
+    println!("version {}, Copyright © 2024 Brando. All rights reserved.", VERSION_STRING);
 }
 
 fn print_version() {
@@ -61,14 +68,13 @@ fn print_version() {
 
 fn main() {
     let mut error = 0;
-    let (h, show_version, srcs, dest) = read_arguments();
-    //env::set_var("RUST_BACKTRACE", "full");
+    let (h, show_version, check, srcs, dest) = read_arguments();
     if h {
         help();
     } else if show_version {
         print_version();
     } else {
-        error = copy_from_source_to_destination(&srcs, &dest);
+        error = copy_from_source_to_destination(&srcs, &dest, check);
     }
 
     std::process::exit(error);
@@ -83,10 +89,11 @@ fn main() {
  * 2 : destination
  * )
  */
-fn read_arguments() -> (bool, bool, Vec<String>, String) {
+fn read_arguments() -> (bool, bool, bool, Vec<String>, String) {
     let args: Vec<String> = env::args().collect();
     let mut help: bool = false;
     let mut version: bool = false;
+    let mut check: bool = false;
     let mut src: Vec<String> = Vec::new();
     let mut dest: String = String::new();
 
@@ -98,27 +105,31 @@ fn read_arguments() -> (bool, bool, Vec<String>, String) {
         let arg = &args[i];
 
         // if this is a flag
-        if (i == 1) && arg.starts_with("-") {
+        if (i == 1) && arg.starts_with("-")  && !arg.starts_with("--") {
             if arg.contains(ARG_HELP) {
                 help = true;
-            } else if arg.contains(ARG_VERSION) {
-                version = true;
+                continue;
             } else if arg.contains(ARG_FORCE_REPLACE) {
                 G_APPLY_TO_ALL_ACTION.store(
                     APPLY_TO_ALL_ACTION_REPLACE,
                     Ordering::Relaxed
                 );
+                continue;
             }
+        } 
+        
+        if arg.contains(ARG_CHECK) {
+            check = true;
+        } else if arg.contains(ARG_VERSION) {
+            version = true;
+        } else if i < (args.len() - 1) {
+            src.push(arg.clone());
         } else {
-            if i < (args.len() - 1) {
-                src.push(arg.clone());
-            } else {
-                dest = arg.clone();
-            }
+            dest = arg.clone();
         }
     }
 
-    return (help, version, src, dest);
+    return (help, version, check, src, dest);
 }
 
 trait LexicalAbsolute {
@@ -250,8 +261,10 @@ fn filter_for_conflicts(path: PathBuf) -> Result<PathBuf, i32> {
 
 /**
  * Copies all items in s to d
+ *
+ * certify: certifies copy
  */
-fn copy_from_source_to_destination(s: &Vec<String>, d: &String) -> i32 {
+fn copy_from_source_to_destination(s: &Vec<String>, d: &String, certify: bool) -> i32 {
     // vector of source/destination pairs
     let mut flows: VecDeque<FileFlow> = VecDeque::new();
     let overall_elapsed_time = Instant::now();
@@ -309,7 +322,7 @@ fn copy_from_source_to_destination(s: &Vec<String>, d: &String) -> i32 {
         let flow_time = Instant::now();
         let dest_size = Arc::new(AtomicU64::new(0));
         let arc_dest_size = Arc::clone(&dest_size);
-        if let Err(e) = flow.copy(move |destination_size| {
+        if let Err(e) = flow.copy(certify, move |destination_size| {
             arc_dest_size.store(destination_size, Ordering::Relaxed);
         }) {
             eprintln!(" ! Error copying file {}: {}", flow.source, e);
@@ -335,57 +348,59 @@ fn copy_from_source_to_destination(s: &Vec<String>, d: &String) -> i32 {
         );
 
         // read destination
-        let flow_time = Instant::now();
-        dest_size.store(0, Ordering::Relaxed);
-        let arc_dest_size = Arc::clone(&dest_size);
-        if let Err(e) = flow.read_destination(move |destination_size| {
-            arc_dest_size.store(destination_size, Ordering::Relaxed);
-        }) {
-            eprintln!(" ! Error reading file {}: {}", flow.destination, e);
-            return -1;
-        }
-
-        // wait for check to end
-        set_progress_bar_action("Reading", Color::Cyan, Style::Bold);
-        loop {
-            let dsize = dest_size.load(Ordering::Relaxed);
-            if source_size <= dsize {
-                break;
-            } else {
-                set_progress_bar_progress(dsize as usize);
+        if certify {
+            let flow_time = Instant::now();
+            dest_size.store(0, Ordering::Relaxed);
+            let arc_dest_size = Arc::clone(&dest_size);
+            if let Err(e) = flow.read_destination(move |destination_size| {
+                arc_dest_size.store(destination_size, Ordering::Relaxed);
+            }) {
+                eprintln!(" ! Error reading file {}: {}", flow.destination, e);
+                return -1;
             }
-            thread::sleep(Duration::from_millis(5));
-        }
-        print_progress_bar_info(
-            "Read",
-            format!("'{}' in {} seconds, {} bytes", file_name, flow_time.elapsed().as_secs(), source_size).as_str(),
-            Color::Green,
-            Style::Bold
-        );
 
-        match flow.check() {
-            Ok(res) => {
-                print_progress_bar_info(
-                    "Success",
-                    format!("SHA-256('{}')", res).as_str(),
-                    Color::Green,
-                    Style::Bold
-                );
+            // wait for check to end
+            set_progress_bar_action("Reading", Color::Cyan, Style::Bold);
+            loop {
+                let dsize = dest_size.load(Ordering::Relaxed);
+                if source_size <= dsize {
+                    break;
+                } else {
+                    set_progress_bar_progress(dsize as usize);
+                }
+                thread::sleep(Duration::from_millis(5));
             }
-            Err((s,d)) => {
-                print_progress_bar_info(
-                    "Source",
-                    format!("source hash: SHA-256('{}')", s).as_str(),
-                    Color::Yellow,
-                    Style::Bold
-                );
+            print_progress_bar_info(
+                "Read",
+                format!("'{}' in {} seconds, {} bytes", file_name, flow_time.elapsed().as_secs(), source_size).as_str(),
+                Color::Green,
+                Style::Bold
+            );
 
-                print_progress_bar_info(
-                    "Failure",
-                    format!("incorrect hash: SHA-256('{}')", d).as_str(),
-                    Color::Red,
-                    Style::Bold
-                );
+            match flow.check() {
+                Ok(res) => {
+                    print_progress_bar_info(
+                        "Success",
+                        format!("SHA-256('{}')", res).as_str(),
+                        Color::Green,
+                        Style::Bold
+                    );
+                }
+                Err((s,d)) => {
+                    print_progress_bar_info(
+                        "Source",
+                        format!("source hash: SHA-256('{}')", s).as_str(),
+                        Color::Yellow,
+                        Style::Bold
+                    );
+
+                    print_progress_bar_info(
+                        "Failure",
+                        format!("incorrect hash: SHA-256('{}')", d).as_str(),
+                        Color::Red,
+                        Style::Bold
+                    );
+                }
             }
         }
 
@@ -565,8 +580,10 @@ impl FileFlow {
      *
      * update_callback: gets invoked for every buffer that is written to destination. value is the
      * new size of the destination
+     *
+     * make_source_hash: makes sha2-256 hash using the sha2 lib
      */
-    pub fn copy<F: Fn(u64) + Send + 'static>(&self, update_callback: F) -> io::Result<()> {
+    pub fn copy<F: Fn(u64) + Send + 'static>(&self, make_source_hash: bool, update_callback: F) -> io::Result<()> {
         let source_file = fs::File::open(&self.source)?;
         let destination_file = fs::File::create(&self.new_destination)?;
 
@@ -594,7 +611,11 @@ impl FileFlow {
 
             // read thread
             let stream_rh = Arc::clone(&stream);
-            let hash_source_rh = Arc::clone(&self.hash_source);
+            let hash_source_rh: Option<Arc<Mutex<Sha256>>> = if make_source_hash {
+                Some(Arc::clone(&self.hash_source))
+            } else {
+                None
+            };
             thread::Builder::new()
                 .name("read_thread".into())
                 .stack_size(stack_size)
@@ -617,7 +638,9 @@ impl FileFlow {
                                             eprintln!(" ! couldn't send buf to write thread");
                                             break;
                                         }
-                                        hash_source_rh.lock().unwrap().update(&buffer);
+                                        if let Some(hash) = &hash_source_rh {
+                                            hash.lock().unwrap().update(&buffer);
+                                        }
                                     } else {
                                         break; // End of file
                                     }
