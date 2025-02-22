@@ -1,5 +1,6 @@
 **x.x**
 - [ ] option to customize buffer and stream size
+- [ ] shows data speed
 
 **0.2**
 - [x] catch duplicates
