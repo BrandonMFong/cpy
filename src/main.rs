@@ -21,8 +21,10 @@ use std::panic;
 use std::sync::Arc;
 use crossbeam_queue::ArrayQueue;
 use progress_bar::*;
-use std::mem::ManuallyDrop;
 use std::collections::VecDeque;
+use sha2::{Sha256, Digest};
+use std::sync::Mutex;
+use hex;
 
 const VERSION_STRING: &str = "0.2";
 const BUFFER_SIZE: u64 = 1024_u64.pow(2) * 10; // Chunk size for copying
@@ -60,7 +62,7 @@ fn print_version() {
 fn main() {
     let mut error = 0;
     let (h, show_version, srcs, dest) = read_arguments();
-
+    //env::set_var("RUST_BACKTRACE", "full");
     if h {
         help();
     } else if show_version {
@@ -117,109 +119,6 @@ fn read_arguments() -> (bool, bool, Vec<String>, String) {
     }
 
     return (help, version, src, dest);
-}
-
-/**
- * Copies all items in s to d
- */
-fn copy_from_source_to_destination(s: &Vec<String>, d: &String) -> i32 {
-    // vector of source/destination pairs
-    let mut flows: VecDeque<FileFlow> = VecDeque::new();
-    let overall_elapsed_time = Instant::now();
-
-    print!("Items found: 0");
-    init_progress_bar(0);
-
-    let mut counter = 0;
-    let full_dest_path = canonicalize(d).unwrap().into_os_string().into_string().unwrap();
-    for source in s.iter() {
-        let full_source_path = canonicalize(source).unwrap().into_os_string().into_string().unwrap();
-    
-        // Find all items in source directory
-        match find_leaf_files(source, &mut counter) {
-            Err(e) => {
-                eprintln!(" ! Experienced an error in: {} - {}", type_name::<fn()>(), e.kind()); 
-                return -1;
-            } Ok(files) => {
-                for file in files {
-                    flows.push_back(FileFlow::new(&full_source_path, &file, &full_dest_path));
-                }
-            }
-        }
-    }
-
-    // Get full paths for params
-
-    println!();
-
-    // Do copy
-    // 
-    // This will only copy one by one
-    let num_flows = flows.len();
-    let mut i = 0;
-    while let Some(mut flow) = flows.pop_front() {
-        let flow_time = Instant::now();
-
-        // make sure we know where we are copying to
-        if flow.setup() != 0 {
-            return -1;
-        }
-
-        let source_size = flow.source_size();
-        let file_name = flow.new_destination_file_name();
-
-        init_progress_bar(source_size as usize);
-        enable_eta();
-        print_progress_bar_info(
-            "Item",
-            format!("({} / {}) '{}'", i + 1, num_flows, file_name).as_str(),
-            Color::Green,
-            Style::Bold
-        );
-        set_progress_bar_action("Copying", Color::Green, Style::Bold);
-        set_progress_bar_width(25);
-
-        // Execute copy
-        let dest_size = Arc::new(AtomicU64::new(0));
-        let arc_dest_size = Arc::clone(&dest_size);
-        if let Err(e) = flow.copy(move |destination_size| {
-            arc_dest_size.store(destination_size, Ordering::Relaxed);
-        }) {
-            eprintln!(" ! Error copying file {}: {}", flow.source, e);
-            return -1;
-        }
-
-        // wait for copy to end
-        loop {
-            let dsize = dest_size.load(Ordering::Relaxed);
-            if source_size <= dsize {
-                break;
-            } else {
-                set_progress_bar_progress(dsize as usize);
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        print_progress_bar_info(
-            "Copied",
-            format!("'{}' in {} seconds, {} bytes", file_name, flow_time.elapsed().as_secs(), source_size).as_str(),
-            Color::Green,
-            Style::Bold
-        );
-
-        flow.set_permissions();
-
-        drop(flow);
-        i += 1;
-    }
-    print_progress_bar_final_info(
-        "Finished",
-        format!("copied all in {} seconds", overall_elapsed_time.elapsed().as_secs()).as_str(),
-        Color::Green,
-        Style::Bold
-    );
-    finalize_progress_bar();
-
-    return 0;
 }
 
 trait LexicalAbsolute {
@@ -349,6 +248,163 @@ fn filter_for_conflicts(path: PathBuf) -> Result<PathBuf, i32> {
     return Ok(result);
 }
 
+/**
+ * Copies all items in s to d
+ */
+fn copy_from_source_to_destination(s: &Vec<String>, d: &String) -> i32 {
+    // vector of source/destination pairs
+    let mut flows: VecDeque<FileFlow> = VecDeque::new();
+    let overall_elapsed_time = Instant::now();
+
+    print!("Items found: 0");
+    init_progress_bar(0);
+
+    let mut counter = 0;
+    let full_dest_path = canonicalize(d).unwrap().into_os_string().into_string().unwrap();
+    for source in s.iter() {
+        let full_source_path = canonicalize(source).unwrap().into_os_string().into_string().unwrap();
+    
+        // Find all items in source directory
+        match find_leaf_files(source, &mut counter) {
+            Err(e) => {
+                eprintln!(" ! Experienced an error in: {} - {}", type_name::<fn()>(), e.kind()); 
+                return -1;
+            } Ok(files) => {
+                for file in files {
+                    flows.push_back(FileFlow::new(&full_source_path, &file, &full_dest_path));
+                }
+            }
+        }
+    }
+
+    // Get full paths for params
+
+    println!();
+
+    // Do copy
+    // 
+    // This will only copy one by one
+    let num_flows = flows.len();
+    let mut i = 0;
+    while let Some(mut flow) = flows.pop_front() {
+        // make sure we know where we are copying to
+        if flow.setup() != 0 {
+            return -1;
+        }
+
+        let source_size = flow.source_size();
+        let file_name = flow.new_destination_file_name();
+
+        init_progress_bar(source_size as usize);
+        enable_eta();
+        print_progress_bar_info(
+            "Item",
+            format!("({} / {}) '{}'", i + 1, num_flows, file_name).as_str(),
+            Color::Green,
+            Style::Bold
+        );
+        set_progress_bar_width(25);
+
+        // Execute copy
+        let flow_time = Instant::now();
+        let dest_size = Arc::new(AtomicU64::new(0));
+        let arc_dest_size = Arc::clone(&dest_size);
+        if let Err(e) = flow.copy(move |destination_size| {
+            arc_dest_size.store(destination_size, Ordering::Relaxed);
+        }) {
+            eprintln!(" ! Error copying file {}: {}", flow.source, e);
+            return -1;
+        }
+
+        // wait for copy to end
+        set_progress_bar_action("Copying", Color::Cyan, Style::Bold);
+        loop {
+            let dsize = dest_size.load(Ordering::Relaxed);
+            if source_size <= dsize {
+                break;
+            } else {
+                set_progress_bar_progress(dsize as usize);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        print_progress_bar_info(
+            "Copied",
+            format!("'{}' in {} seconds, {} bytes", file_name, flow_time.elapsed().as_secs(), source_size).as_str(),
+            Color::Green,
+            Style::Bold
+        );
+
+        // read destination
+        let flow_time = Instant::now();
+        dest_size.store(0, Ordering::Relaxed);
+        let arc_dest_size = Arc::clone(&dest_size);
+        if let Err(e) = flow.read_destination(move |destination_size| {
+            arc_dest_size.store(destination_size, Ordering::Relaxed);
+        }) {
+            eprintln!(" ! Error reading file {}: {}", flow.destination, e);
+            return -1;
+        }
+
+        // wait for check to end
+        set_progress_bar_action("Reading", Color::Cyan, Style::Bold);
+        loop {
+            let dsize = dest_size.load(Ordering::Relaxed);
+            if source_size <= dsize {
+                break;
+            } else {
+                set_progress_bar_progress(dsize as usize);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        print_progress_bar_info(
+            "Read",
+            format!("'{}' in {} seconds, {} bytes", file_name, flow_time.elapsed().as_secs(), source_size).as_str(),
+            Color::Green,
+            Style::Bold
+        );
+
+        match flow.check() {
+            Ok(res) => {
+                print_progress_bar_info(
+                    "Success",
+                    format!("SHA-256('{}')", res).as_str(),
+                    Color::Green,
+                    Style::Bold
+                );
+            }
+            Err((s,d)) => {
+                print_progress_bar_info(
+                    "Source",
+                    format!("source hash: SHA-256('{}')", s).as_str(),
+                    Color::Yellow,
+                    Style::Bold
+                );
+
+                print_progress_bar_info(
+                    "Failure",
+                    format!("incorrect hash: SHA-256('{}')", d).as_str(),
+                    Color::Red,
+                    Style::Bold
+                );
+            }
+        }
+
+        flow.set_permissions();
+
+        drop(flow);
+        i += 1;
+    }
+    print_progress_bar_final_info(
+        "Finished",
+        format!("copied all in {} seconds", overall_elapsed_time.elapsed().as_secs()).as_str(),
+        Color::Green,
+        Style::Bold
+    );
+    finalize_progress_bar();
+
+    return 0;
+}
+
 struct FileFlow {
     /// Source file
     pub source: String,
@@ -362,6 +418,9 @@ struct FileFlow {
     /// Where source file will go respecting
     /// the file structure in base path
     new_destination: String,
+
+    hash_source: Arc<Mutex<Sha256>>,
+    hash_dest: Arc<Mutex<Sha256>>,
 }
 
 impl FileFlow {
@@ -371,7 +430,9 @@ impl FileFlow {
             base: b.to_string(),
             source: s.to_string(),
             destination: d.to_string(),
-            new_destination: String::new()
+            new_destination: String::new(),
+            hash_source: Arc::new(Mutex::new(Sha256::new())),
+            hash_dest: Arc::new(Mutex::new(Sha256::new())),
         }
     }
 
@@ -409,6 +470,27 @@ impl FileFlow {
             Err(_) => {
                 String::from(default_name)
             }
+        }
+    }
+
+    /**
+     * compares the hashes of the source and destination
+     *
+     * if they match then copy was successful
+     *
+     * Ok() will return the destination hash. 
+     * Err(s, h) returns both hashes (source, destination). This will mean they are incorrect
+     */
+    fn check(&self) -> Result<String, (String, String)> {
+        let shash = &self.hash_source.lock().unwrap().clone().finalize().to_vec();
+        let dhash = &self.hash_dest.lock().unwrap().clone().finalize().to_vec();
+        if shash == dhash {
+            Ok(hex::encode(dhash))
+        } else {
+            Err((
+                hex::encode(shash),
+                hex::encode(dhash)
+            ))
         }
     }
 
@@ -508,10 +590,11 @@ impl FileFlow {
         } else {
             let source_size = self.source_size();
             let stack_size = BUFFER_SIZE as usize * STREAM_SIZE as usize;
-            let stream: Arc<ArrayQueue<ManuallyDrop<[u8;BUFFER_SIZE as usize]>>> = Arc::new(ArrayQueue::new(STREAM_SIZE));
+            let stream: Arc<ArrayQueue<[u8;BUFFER_SIZE as usize]>> = Arc::new(ArrayQueue::new(STREAM_SIZE));
 
             // read thread
             let stream_rh = Arc::clone(&stream);
+            let hash_source_rh = Arc::clone(&self.hash_source);
             thread::Builder::new()
                 .name("read_thread".into())
                 .stack_size(stack_size)
@@ -525,7 +608,7 @@ impl FileFlow {
                             } else {
                                 source_size - total_read
                             };
-                            let mut buffer = ManuallyDrop::new([0; BUFFER_SIZE as usize]);
+                            let mut buffer = [0; BUFFER_SIZE as usize];
                             match readbuf.read(&mut buffer[..buf_size as usize]) {
                                 Ok(bytes_read) => {
                                     if bytes_read > 0 {
@@ -534,7 +617,7 @@ impl FileFlow {
                                             eprintln!(" ! couldn't send buf to write thread");
                                             break;
                                         }
-                                        unsafe { ManuallyDrop::drop(&mut buffer)} ;
+                                        hash_source_rh.lock().unwrap().update(&buffer);
                                     } else {
                                         break; // End of file
                                     }
@@ -545,9 +628,6 @@ impl FileFlow {
                             }
                         }
                     }
-                    drop(stream_rh);
-                    drop(readbuf);
-                    //println!("read end");
             }).unwrap();
 
             // write thread
@@ -570,25 +650,64 @@ impl FileFlow {
                             continue;
                         }
                         wait_count = 0;
-                        let mut buffer = stream_wh.pop().unwrap();
+                        let buffer = stream_wh.pop().unwrap();
                         let buf_size: u64 = if (source_size - total_bytes_copied) > BUFFER_SIZE {
                             BUFFER_SIZE
                         } else {
                             source_size - total_bytes_copied
                         };
-
                         if let Err(e) = writebuf.write_all(&buffer[..buf_size as usize]) {
                             panic!("{}", e);
                         }
                         total_bytes_copied += buf_size;
                         update_callback(total_bytes_copied);
-                        unsafe { ManuallyDrop::drop(&mut buffer) };
                     }
-                    drop(writebuf);
-                    drop(stream_wh);
             }).unwrap();
-            drop(stream);
         }
+
+        Ok(())
+    }
+
+    /**
+     * calculates the sha has for destination. Uses update_callback to update caller on the 
+     * read progress
+     */
+    pub fn read_destination<F: Fn(u64) + Send + 'static>(&self, update_callback: F) -> io::Result<()> {
+        let destination_file = fs::File::open(&self.new_destination)?;
+        let source_size = self.source_size();
+        let stack_size = BUFFER_SIZE as usize * STREAM_SIZE as usize;
+
+        // read thread
+        let hash_dest_rh = Arc::clone(&self.hash_dest);
+        thread::Builder::new()
+            .name("read_thread".into())
+            .stack_size(stack_size)
+            .spawn(move || {
+                let mut total_read = 0;
+                let mut readbuf = BufReader::with_capacity(BUFFER_SIZE as usize, destination_file);
+                loop {
+                    let buf_size: u64 = if (source_size - total_read) > BUFFER_SIZE {
+                        BUFFER_SIZE
+                    } else {
+                        source_size - total_read
+                    };
+                    let mut buffer = [0; BUFFER_SIZE as usize];
+                    match readbuf.read(&mut buffer[..buf_size as usize]) {
+                        Ok(bytes_read) => {
+                            if bytes_read > 0 {
+                                total_read += bytes_read as u64;
+                                hash_dest_rh.lock().unwrap().update(&buffer);
+                                update_callback(total_read);
+                            } else {
+                                break; // End of file
+                            }
+                        }
+                        Err(e) => {
+                            panic!("read error {}", e);
+                        }
+                    }
+                }
+        }).unwrap();
 
         Ok(())
     }
