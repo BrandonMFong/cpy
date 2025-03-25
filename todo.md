@@ -2,6 +2,8 @@
 - [ ] option to customize buffer and stream size
 - [ ] shows data speed
 	- [ ] show read and write speed separately
+- [ ] make sure check handles errors correctly
+- [ ] show bytes in mb, gb, tb, etc.
 
 **0.2**
 - [x] catch duplicates
