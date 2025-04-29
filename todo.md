@@ -1,5 +1,9 @@
 **x.x**
 - [ ] option to customize buffer and stream size
+
+
+**0.3**
+- [ ] write to smb destination
 - [ ] shows data speed
 	- [ ] show read and write speed separately
 - [ ] make sure check handles errors correctly
